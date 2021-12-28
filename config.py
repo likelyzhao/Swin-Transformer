@@ -188,7 +188,7 @@ def update_config(config, args):
     _update_config_from_file(config, args.cfg)
 
     config.defrost()
-    if args.opts:
+    if 'opts' in args and args.opts:
         config.merge_from_list(args.opts)
 
     # merge from specific arguments
