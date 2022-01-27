@@ -64,15 +64,17 @@ class TokenLearnerV11(nn.Module):
 
 
 class TokenLearnerV11windows(nn.Module):
-    def __init__(self, in_c, num_tokens, windows_size, drop=0.):
+    def __init__(self, in_c, num_tokens, windows_size, drop=0):
         super().__init__()
         self.in_c = in_c
         self.num_tokens = num_tokens
         self.input_resolution= windows_size
         self.norm = nn.LayerNorm(self.in_c)
-        self.groupconv_select = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=8, bias=False)
-        self.conv1x1_select = nn.Conv2d(self.in_c, self.num_tokens, kernel_size=1, stride=1, groups=8, bias=False)
-        self.groupconv_feat = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=8, bias=False)
+        self.gelu = nn.GELU()
+        self.num_groups = 1 if in_c < 256 else in_c // 128
+        self.groupconv_select = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=self.num_groups, bias=False)
+        self.conv1x1_select = nn.Conv2d(self.in_c, self.num_tokens, kernel_size=1, stride=1, bias=False)
+        self.groupconv_feat = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=self.num_groups, bias=False)
         self.drop = nn.Dropout(drop)
         self.softmax = nn.Softmax(dim=-1)
 
@@ -84,10 +86,11 @@ class TokenLearnerV11windows(nn.Module):
         #selected = selected.reshape(selected.shape[0], -1, self.input_resolution[0], self.input_resolution[1])
         selected = selected.reshape(-1, self.in_c, self.input_resolution[0], self.input_resolution[1])
         selected = self.groupconv_select(selected)
+        selected = self.gelu(selected)
         selected = self.conv1x1_select(selected)
         selected = selected.reshape(selected.shape[0], -1, selected.shape[2] * selected.shape[3])
         selected = self.softmax(selected)
-        selected = selected.reshape(-1, selected.shape[1], selected.shape[2])
+        #selected = selected.reshape(-1, selected.shape[1], selected.shape[2])
         #selected = selected.reshape(selected.shape[0], -1, selected.shape[3])
         #selected = self.softmax(selected)
 
@@ -96,8 +99,8 @@ class TokenLearnerV11windows(nn.Module):
         #feat = feat.reshape(selected.shape[0], -1, self.input_resolution[0], self.input_resolution[1])
         feat = feat.reshape(-1, self.in_c, self.input_resolution[0], self.input_resolution[1])
         feat = self.groupconv_feat(feat)
-        feat = feat.reshape(-1, feat.shape[1],  feat.shape[2], feat.shape[3])
-        feat = feat.reshape(feat.shape[0], feat.shape[3]*feat.shape[2], -1)
+        feat = feat.reshape(-1, feat.shape[1],  feat.shape[2]*feat.shape[3])
+        feat = torch.transpose(feat, -2, -1)
         feat = torch.einsum('...si,...id->...sd', selected, feat)
 
         feat = feat.reshape(feat.shape[0], -1, feat.shape[-1])
@@ -173,13 +176,14 @@ class TokenFuserWindows(nn.Module):
         self.num_tokens = num_tokens
         self.use_normalization = use_normalization
         self.windows_size= windows_size
-        self.norm_original = nn.LayerNorm([self.in_c, self.windows_size[0], self.windows_size[1]])
+        # self.norm_original = nn.LayerNorm([self.in_c, self.windows_size[0], self.windows_size[1]])
+        self.norm_original = nn.LayerNorm(self.in_c)
         if use_normalization:
-            self.norm_input = nn.LayerNorm([self.num_tokens, self.in_c])
-            self.norm_input_2 = nn.LayerNorm(num_tokens)
+            self.norm_input = nn.LayerNorm(self.in_c)
+            self.norm_input_2 = nn.LayerNorm(self.in_c)
         self.dense_input = nn.Linear(self.num_tokens, self.num_tokens)
         self.conv1x1_mix = nn.Conv2d(self.in_c, self.num_tokens, kernel_size=1, stride=1, bias=False)
-        self.groupconv_feat = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=8)
+        # self.groupconv_feat = nn.Conv2d(self.in_c, self.in_c, kernel_size=1, stride=1, groups=8)
         self.drop = nn.Dropout(drop)
         self.softmax = nn.Softmax(dim= -1)
         self.sigmoid = nn.Sigmoid()
@@ -193,29 +197,30 @@ class TokenFuserWindows(nn.Module):
             
         inputs = torch.transpose(inputs, -1, -2)   
         inputs = self.dense_input(inputs)
-        if self.use_normalization:
-            inputs = self.norm_input_2(inputs)
         inputs = torch.transpose(inputs, -1, -2)        
-        
+        if self.use_normalization:
+            inputs = self.norm_input_2(inputs)      
+
         inputs = torch.unsqueeze(inputs, 1)
         inputs = torch.unsqueeze(inputs, 1)
 
+        original = self.norm_original(original)
         original = torch.transpose(original, -1, -2)
         feat_dim = original.shape[0]
         original = original.reshape(-1, self.in_c,  self.windows_size[0], self.windows_size[1])
-        original = self.norm_original(original)
+        # original = self.norm_original(original)
         mix = self.conv1x1_mix(original)
         mix = mix.reshape(feat_dim, -1, self.windows_size[0]*self.windows_size[1])
         mix = torch.transpose(mix, -1, -2)
         mix = self.sigmoid(mix)
-        mix = torch.transpose(mix, -1, -2)
-        mix = mix.reshape(mix.shape[0], self.windows_size[0], self.windows_size[1], mix.shape[1], -1)
-        #mix = torch.unsqueeze(mix, -1)
+        #mix = torch.transpose(mix, -1, -2)
+        mix = mix.reshape(-1, self.windows_size[0], self.windows_size[1], mix.shape[2])
+        mix = torch.unsqueeze(mix, -1)
 
         inputs = inputs * mix 
         inputs = torch.sum(inputs, dim =-2)
 
-        inputs = inputs.reshape(inputs.shape[0], -1, inputs.shape[3])
+        inputs = inputs.reshape(-1, self.windows_size[0]*self.windows_size[1], inputs.shape[3])
         #inputs = inputs.reshape(inputs.shape[0], -1, inputs.shape[-1])
         #inputs = torch.transpose(inputs, 0, 1)
         return self.drop(inputs)
@@ -782,10 +787,10 @@ class SwinTransformerBlockMod(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.learner = TokenLearnerV11windows(dim, num_tokens=8, windows_size=(window_size, window_size), drop= drop)
-        self.fuser = TokenFuserWindows(dim, windows_size=(window_size, window_size), num_tokens=8, drop= drop)
+        self.learner = TokenLearnerV11windows(dim, num_tokens=16, windows_size=(window_size, window_size), drop= drop)
+        self.fuser = TokenFuserWindows(dim, windows_size=(window_size, window_size), num_tokens=16, drop= drop)
         self.attn = WindowAttentionMod(
-            dim, num_token=8, num_heads=num_heads,
+            dim, num_token=16, num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -1811,7 +1816,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     #args.cfg = "/data/zhaozhijian/Swin-Transformer/ckpt/swin_tiny_patch64_window4_192_48.yaml"
-    args.cfg = '/data/zhaozhijian/Swin-Transformer/ckpt/swin_tiny_patch4_window7_224_48.yaml'
+    args.cfg = '/data/zhaozhijian/Swin-Transformer/ckpt/swin_tiny_patch4_window7_224-2.yaml'
     args.batch_size =1
     args.data_path =""
     args.local_rank =0
@@ -1819,7 +1824,7 @@ if __name__ == "__main__":
     config = get_config(args)
 
 
-    model = SwinTransformer(img_size=config.DATA.IMG_SIZE,
+    model = SwinTransformerLearn(img_size=config.DATA.IMG_SIZE,
                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
                                 in_chans=config.MODEL.SWIN.IN_CHANS,
                                 num_classes=max(args.num_classes,config.MODEL.NUM_CLASSES),
@@ -1837,7 +1842,7 @@ if __name__ == "__main__":
                                 use_checkpoint=config.TRAIN.USE_CHECKPOINT)
     
     #input =  torch.rand([1, 3,224,224])
-    input =  torch.rand([1, 3, config.DATA.IMG_SIZE, config.DATA.IMG_SIZE])
+    input =  torch.rand([100, 3, config.DATA.IMG_SIZE, config.DATA.IMG_SIZE])
     res = model(input)
     print(res.shape)
     from thop import profile
